@@ -12,7 +12,7 @@
 | **Testing Date** | June 2025 |
 | **Prepared By** | Aadith (Security Researcher) |
 | **Report Classification** | Confidential |
-| **Report Version** | 1.0 |
+| **Report Version** | 1.1 |
 
 ---
 
@@ -206,6 +206,13 @@ Any actor with access to the IPA file can recover the credentials in under five 
 
 `Payload/DVIA-v2.app/DVIA-v2` — Authentication module (confirmed via Ghidra XREF)
 
+**Mitigation**
+
+- Remove all hardcoded credentials from the binary immediately — credentials must never be embedded in client-side code or resources.
+- Implement **server-side authentication** exclusively; the client should supply credentials to the server, which validates them against a securely stored (hashed + salted) credential store.
+- If a default test account is needed for development, manage it through a separate, non-distributed configuration and rotate credentials before any build is distributed.
+- Use a secrets scanner (e.g. `truffleHog`, `gitleaks`) in the CI/CD pipeline to detect accidental credential commits going forward.
+
 ---
 
 ### F-02 — Hardcoded Encryption Password
@@ -231,6 +238,13 @@ A hardcoded password used for data encryption was found embedded in the binary. 
 **Impact**
 
 With the encryption password recovered from the binary, any encrypted files produced by the application can be decrypted offline by an attacker without device access, completely defeating the purpose of encryption.
+
+**Mitigation**
+
+- Never embed cryptographic keys or key-derivation passwords in the application binary or any bundled resource file.
+- Generate encryption keys at runtime using the **iOS Secure Enclave** or derive them from a user-supplied passphrase via a strong KDF (PBKDF2, Argon2, or scrypt) with a securely generated random salt.
+- Store derived or generated keys exclusively in the **iOS Keychain** with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` to ensure keys are device-bound and only accessible when the device is unlocked.
+- For data that must remain accessible without user interaction (e.g. background refresh), use `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` as the least permissive option that satisfies the use case.
 
 ---
 
@@ -259,6 +273,13 @@ PBKDF2 iterations = 500
 **Impact**
 
 Brute-force attacks against derived keys are highly feasible. Combined with F-02 (hardcoded password), the encryption is effectively broken.
+
+**Mitigation**
+
+- Increase PBKDF2 iteration count to a minimum of **210,000 iterations** using PBKDF2-HMAC-SHA256, in line with NIST SP 800-132 (2023).
+- If migrating existing users, implement a migration path: re-derive and re-encrypt stored data with the new parameters upon the user's next authenticated session.
+- Consider adopting **Argon2id** (winner of the Password Hashing Competition) as a more memory-hard alternative that is more resistant to GPU/ASIC-based brute-force attacks, if supported by the target iOS deployment.
+- Use a cryptographically random salt of at least **16 bytes** (128 bits), generated fresh per key derivation operation and stored alongside the derived key material.
 
 ---
 
@@ -293,6 +314,13 @@ NSUserDefaults ← confirmed by string reference
 
 An attacker with file system access (jailbroken device, malicious backup restore) can set `loggedIn = true` to bypass authentication without providing any credentials.
 
+**Mitigation**
+
+- Move the authentication state flag (and any other security-relevant values) from `NSUserDefaults` to the **iOS Keychain**, using `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` so the value is inaccessible outside the authenticated device.
+- Never use `NSUserDefaults` for any security-sensitive data — it is plaintext, included in backups by default, and offers no access control.
+- Complement client-side session state with **server-side session validation**: the app should verify session validity with the backend on each sensitive action, not rely solely on a local `loggedIn` flag.
+- Ensure Keychain items used for auth state are excluded from iCloud/iTunes backup by setting `kSecAttrSynchronizable` to `false`.
+
 ---
 
 ### F-05 — Weak Cryptographic Algorithms (MD5, SHA-1)
@@ -326,6 +354,14 @@ HMAC-SHA1
 
 Data integrity checks using these algorithms can be bypassed. Passwords hashed with MD5/SHA-1 are vulnerable to rainbow table and brute-force attacks.
 
+**Mitigation**
+
+- Replace all uses of MD5 and SHA-1 with **SHA-256** or **SHA-3 (SHA3-256)** for integrity hashing and general-purpose digest operations.
+- For password hashing specifically, use an adaptive, salted password hashing function: **bcrypt**, **scrypt**, or **Argon2id** — never a raw SHA digest.
+- For MAC operations, replace HMAC-SHA1 with **HMAC-SHA256** or **HMAC-SHA512**.
+- Use Apple's **CryptoKit** framework (available iOS 13+) which provides modern, audited implementations of SHA-256, SHA-512, HMAC, AES-GCM, and ChaCha20-Poly1305, reducing the risk of cryptographic misuse.
+- Audit all use sites in Ghidra (via XREF on `CC_MD5`, `CC_SHA1`, `CCHmac`) to ensure no remaining references persist after remediation.
+
 ---
 
 ### F-06 — Sensitive Data in Local Storage
@@ -355,6 +391,14 @@ Additionally, the application uses both **Realm** (local NoSQL database) and **S
 
 On a jailbroken device or via backup extraction, an attacker can access these files and recover sensitive application data.
 
+**Mitigation**
+
+- Apply **iOS Data Protection** to all sensitive files by setting `NSFileProtectionComplete` (or at minimum `NSFileProtectionCompleteUnlessOpen`) as the file attribute at creation time, ensuring files are encrypted when the device is locked.
+- For Realm databases, enable **Realm Encryption** using a 64-byte AES-256 key stored in the Keychain — Realm natively supports full database encryption via its configuration object.
+- For SQLite databases, use **SQLCipher** (an encrypted SQLite extension) to encrypt the entire database file at rest.
+- Avoid writing sensitive data to paths accessible outside the app sandbox (e.g. shared containers, `Documents` if iCloud backup is enabled); use `Library/Application Support` with backup exclusion for sensitive non-user files.
+- Exclude sensitive local files from iCloud and iTunes backups by setting `NSURLIsExcludedFromBackupKey = true` on the file URL.
+
 ---
 
 ### F-07 — Internal Endpoint Path Disclosure
@@ -380,6 +424,13 @@ An internal API endpoint path was discovered hardcoded within the binary:
 **Impact**
 
 Exposing internal endpoint paths aids attackers in mapping server-side attack surface and facilitates targeted API abuse, especially if combined with the hardcoded credentials found in F-01.
+
+**Mitigation**
+
+- Do not hardcode internal API endpoint paths in the binary. Load all API routes dynamically from a server-side configuration endpoint that is fetched at runtime after authenticated session establishment.
+- Apply **server-side authorization** on all endpoints regardless of whether their paths are known — security through obscurity alone is not a valid control.
+- If endpoint paths must be bundled client-side, consider obfuscating them; however, this is a secondary control and not a substitute for proper server-side access control.
+- Regularly audit the binary for hardcoded strings (endpoint paths, environment URLs, internal hostnames) as part of the pre-release security review process.
 
 ---
 
@@ -412,6 +463,7 @@ The application's `Info.plist` contains the `NSAppTransportSecurity` dictionary 
 If `NSAllowsArbitraryLoads` is set to `true`, all network traffic is permitted over HTTP, enabling man-in-the-middle (MitM) attacks to intercept and modify data in transit. Severity escalates to **High** if value is confirmed `true`.
 
 **Note:** Full confirmation of the boolean value requires:
+
 ```bash
 python3 -c "
 import plistlib
@@ -420,6 +472,14 @@ with open('Info.plist','rb') as f:
 print(p.get('NSAppTransportSecurity'))
 "
 ```
+
+**Mitigation**
+
+- Remove the `NSAllowsArbitraryLoads` key entirely from `Info.plist` to restore default ATS enforcement (TLS 1.2+ required for all connections).
+- If specific third-party domains require HTTP (e.g. a legacy CDN), use **domain-specific ATS exceptions** (`NSExceptionDomains`) scoped to exactly those domains, rather than a global bypass.
+- Enforce **TLS 1.2 as a minimum** across all domains the app communicates with; prefer TLS 1.3 where supported.
+- Validate ATS compliance using Apple's diagnostic tool: `nscurl --ats-diagnostics https://yourdomain.com` to confirm all endpoints are reachable under strict ATS settings before shipping.
+- Combine with **certificate/public key pinning** on security-critical endpoints to further harden against MitM attacks even on compromised network paths.
 
 ---
 
@@ -450,6 +510,16 @@ While low severity on its own, this information can assist attackers in:
 - Correlating with other OSINT information
 - Understanding build environment structure
 
+**Mitigation**
+
+- Enable the following Xcode build settings in the **Release** configuration to strip debug symbols and embedded path information from production binaries:
+  - `DEPLOYMENT_POSTPROCESSING = YES`
+  - `STRIP_INSTALLED_PRODUCT = YES`
+  - `STRIP_STYLE = all`
+  - `DEBUG_INFORMATION_FORMAT = dwarf-with-dsym` (keeps symbolication data in a separate `.dSYM` bundle, not in the binary)
+- Store `.dSYM` bundles securely for crash symbolication, but never ship them alongside the IPA.
+- Run `strings` against production builds as part of the pre-release checklist to verify that developer paths, internal hostnames, and build-environment details are not present.
+
 ---
 
 ### F-10 — Debug Logging Present in Production Binary
@@ -477,6 +547,28 @@ traceExecution
 
 On a jailbroken device, debug logs can be captured via the device console and may expose sensitive data including authentication tokens, user inputs, or internal state information during runtime.
 
+**Mitigation**
+
+- Wrap all `NSLog` and `print` statements in compile-time debug guards so they are completely excluded from Release builds:
+
+  ```swift
+  #if DEBUG
+  print("Token: \(token)")
+  NSLog("User: %@", username)
+  #endif
+  ```
+
+- Disable or remove the `traceExecution` flag in production configuration; if it controls a logging verbosity level, ensure the default for Release builds is `none` or `off`.
+- Consider replacing ad-hoc `NSLog` usage with a structured logging framework (e.g. **OSLog** / `os_log`) that supports privacy annotations (`%{private}@`) to redact sensitive values from logs even in debug builds:
+
+  ```swift
+  import os
+  let logger = Logger(subsystem: "com.app", category: "auth")
+  logger.debug("User token: \(token, privacy: .private)")
+  ```
+
+- Audit all logging call sites before each release and establish a policy that PII, tokens, credentials, and session data are never written to any log regardless of build configuration.
+
 ---
 
 ## 8. Remediation Recommendations
@@ -494,17 +586,17 @@ On a jailbroken device, debug logs can be captured via the device console and ma
 | Finding | Recommendation |
 |---|---|
 | F-04: NSUserDefaults Auth State | Store authentication state in the **iOS Keychain** with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`. Never use NSUserDefaults for security-sensitive values. |
-| F-05: Weak Crypto (MD5/SHA-1) | Replace MD5 and SHA-1 with **SHA-256** or **SHA-3** for hashing. Use **AES-256-GCM** for symmetric encryption. |
-| F-06: Sensitive Local Storage | Encrypt all local sensitive files using the iOS Data Protection API (`NSFileProtectionComplete`). Use Keychain for small secrets. |
+| F-05: Weak Crypto (MD5/SHA-1) | Replace MD5 and SHA-1 with **SHA-256** or **SHA-3** for hashing. Use **AES-256-GCM** for symmetric encryption. Use Apple's CryptoKit. |
+| F-06: Sensitive Local Storage | Encrypt all local sensitive files using iOS Data Protection (`NSFileProtectionComplete`). Enable Realm encryption. Use SQLCipher for SQLite. |
 | F-07: Endpoint Disclosure | Do not hardcode internal endpoint paths. Load configuration from a server-side configuration endpoint authenticated at runtime. |
-| F-08: ATS Exception | Remove `NSAllowsArbitraryLoads` entirely. Enforce TLS 1.2+ for all connections. If specific domains require exceptions, use domain-specific ATS exceptions rather than a global bypass. |
+| F-08: ATS Exception | Remove `NSAllowsArbitraryLoads` entirely. Enforce TLS 1.2+ for all connections. Use domain-specific ATS exceptions if strictly necessary. |
 
 ### Low Priority (Backlog)
 
 | Finding | Recommendation |
 |---|---|
-| F-09: Source Path Disclosure | Build the application with release/distribution settings that strip debug symbols and path information. Use `DEPLOYMENT_POSTPROCESSING = YES` and `STRIP_INSTALLED_PRODUCT = YES` in Xcode build settings. |
-| F-10: Debug Logging | Disable `NSLog` and all debug logging in production builds. Use compile-time macros (`#if DEBUG`) to gate all log statements. Audit use of `traceExecution`. |
+| F-09: Source Path Disclosure | Enable `DEPLOYMENT_POSTPROCESSING`, `STRIP_INSTALLED_PRODUCT`, and `STRIP_STYLE = all` in Xcode Release build settings. |
+| F-10: Debug Logging | Gate all `NSLog`/`print` statements behind `#if DEBUG`. Use `os_log` with privacy annotations. Audit all log call sites before each release. |
 
 ---
 
@@ -541,7 +633,7 @@ The application also demonstrates several classes of vulnerabilities commonly se
 *This report was prepared as part of an iOS mobile application security assessment for educational and portfolio purposes using DVIA-v2, a deliberately vulnerable application designed for security training.*
 
 *Report prepared by: Aadith | B.Tech Computer Science | Cybersecurity Researcher*
-*Date: June 2025*
+*Date: June 2025 | Version 1.1 — Added per-finding mitigation steps*
 
 ---
 **END OF REPORT**
